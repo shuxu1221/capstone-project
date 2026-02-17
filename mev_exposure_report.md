@@ -1,7 +1,3 @@
-明白。我把报告改成**只聚焦 MEV exposure**，不再提 QuickNode/RPC utilities、gas dashboard 之类的团队其他分工内容。你直接复制下面这一整段英文到 `.md` 文件即可（包含代码引用，仍然是一个文件里放完）。
-
----
-
 # MEV Exposure Report (Payment Service)
 
 ## Scope
@@ -148,11 +144,4 @@ Based on the code provided:
 
 This report is strictly grounded in the behavior visible in `executePayment()` and `buildUnsignedTransaction()`. The final broadcast behavior depends on how `blockchainService.submitSignedTransaction(...)` is implemented (for example, whether it uses standard public RPC submission). The conclusions above assume standard public broadcast semantics, which is consistent with the overall design shown.
 
----
-
-## 中文：你需要粘贴哪些内容到 md 里？
-
-把上面从 `# MEV Exposure Report (Payment Service)` 开始到最后的全部内容（包括代码块）**原样复制**，粘贴进一个新文件，比如 `mev_exposure_report.md`，保存即可。
-
-如果你愿意再进一步“坐实”最后一段的假设，你把 `blockchainService.submitSignedTransaction` 的实现贴出来，我可以把 “public broadcast 假设” 改成“代码证明的事实”，让报告更扎实。
 
