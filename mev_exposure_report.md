@@ -1,16 +1,20 @@
+明白。我把报告改成**只聚焦 MEV exposure**，不再提 QuickNode/RPC utilities、gas dashboard 之类的团队其他分工内容。你直接复制下面这一整段英文到 `.md` 文件即可（包含代码引用，仍然是一个文件里放完）。
+
+---
+
 # MEV Exposure Report (Payment Service)
 
-## Scope and context
+## Scope
 
-This report assesses MEV exposure for the payment execution path implemented in `PaymentsService`, focusing on the on-chain transfer flow in `executePayment()` and transaction construction in `buildUnsignedTransaction()`. The goal is to determine what MEV vectors are realistically applicable given the current behavior, what the likely impact is, and what practical mitigations follow directly from the code.
+This report evaluates MEV exposure for the on-chain payment execution path in `PaymentsService`, based on the implementation of `executePayment()` and `buildUnsignedTransaction()`. The goal is to identify what MEV vectors are realistically applicable given the current transaction behavior, and to state clear, code-based conclusions.
 
-For the purposes of this report, “MEV exposure” means the extent to which a transaction can be observed, reordered, censored/delayed, or used by third parties (searchers/builders/validators) to extract value or impose additional cost/latency on the sender.
+In this report, “MEV exposure” refers to the extent to which a transaction can be observed and then affected by third parties who influence ordering and inclusion (searchers/builders/validators), resulting in value extraction, higher costs, delayed inclusion, or privacy leakage.
 
-## What the code actually does on-chain
+## What transaction is being sent on-chain
 
-The on-chain transaction being signed and broadcast is an ERC-20 `transfer(to, amount)` call for USDC or USDT. There is no swap, no DEX interaction, no price-sensitive execution, and no multi-step atomic sequence on-chain. The payment is effectively a single token transfer from a custodial wallet controlled via Turnkey.
+The on-chain action produced by this service is a single ERC-20 token transfer for USDC or USDT. The transaction data is explicitly encoded as `transfer(to, amount)` and sent to the token contract address.
 
-The key portion is visible in `buildUnsignedTransaction()`:
+This is directly shown in `buildUnsignedTransaction()`:
 
 ```ts
 // Get contract address based on currency
@@ -33,22 +37,61 @@ const transferData = encodeFunctionData({
 });
 ```
 
-Then the transaction parameters are constructed using an RPC gas price quote and an `estimateGas` call with a 10% buffer:
+The signed transaction is produced via Turnkey and then submitted to the network:
+
+```ts
+const unsignedTransaction = await this.buildUnsignedTransaction(
+  sourceAccount.cryptoWalletAddress,
+  destinationAccount.cryptoWalletAddress,
+  BigInt(transferStep.fromAmount),
+  payment.fromCurrency || "USDC",
+);
+
+signedTransaction = await this.signTransactionWithTurnkey(
+  workspace.turnkeySubOrgId,
+  sourceAccount.cryptoWalletAddress,
+  unsignedTransaction,
+  signature,
+  payment.fromNetwork as NetworkKey,
+);
+
+const txHash = await this.blockchainService.submitSignedTransaction(
+  signedTransaction,
+  destinationAccount.cryptoWalletAddress,
+  BigInt(transferStep.fromAmount),
+  payment.fromCurrency || "USDC",
+  payment.fromNetwork as NetworkKey,
+);
+```
+
+This matters because MEV exposure depends heavily on what the transaction *does*. A plain token transfer behaves very differently from price-sensitive DeFi transactions.
+
+## MEV exposure analysis
+
+### 1) Low exposure to “classic” trading MEV (sandwiching/arbitrage)
+
+The most widely discussed MEV attacks (sandwiching swaps, backrunning to capture price impact, extracting arbitrage from AMM trades) require the victim transaction to create a price-relevant state transition. In the code shown here, the service does not interact with an AMM, does not execute a swap, and does not submit a sequence of transactions whose ordering creates a measurable trading opportunity. It submits a single ERC-20 transfer.
+
+Because of that, the typical “value extraction from execution semantics” is low: there is no slippage to worsen, no pool reserves to manipulate, and no quoted execution price to exploit.
+
+The practical conclusion is that the payment execution path is structurally resistant to the most common MEV value-extraction patterns seen in DeFi trading.
+
+### 2) Meaningful exposure to inclusion/ordering dynamics (cost and latency)
+
+Even when a transaction is not economically exploitable via sandwiching, it still participates in an inclusion market: it competes with other pending transactions for space in upcoming blocks. That means it can be delayed, or require a higher fee to achieve timely inclusion, especially during congestion.
+
+In `buildUnsignedTransaction()`, fee selection is based on a single RPC quote:
 
 ```ts
 const [nonce, gasPrice] = await Promise.all([
   publicClient.getTransactionCount({ address: checksummedAddress }),
   publicClient.getGasPrice(),
 ]);
+```
 
-const gasEstimate = await publicClient.estimateGas({
-  account: checksummedAddress,
-  to: contractAddress as `0x${string}`,
-  data: transferData,
-});
+and the transaction is serialized with `gasPrice` rather than explicit EIP-1559 fee caps:
 
-const gasLimit = (gasEstimate * 110n) / 100n; // Add 10% buffer
-
+```ts
 const transactionRequest = {
   to: contractAddress as `0x${string}`,
   value: 0n,
@@ -62,161 +105,54 @@ const transactionRequest = {
 return serializeTransaction(transactionRequest);
 ```
 
-Finally, `executePayment()` signs the unsigned transaction with Turnkey and submits the raw signed transaction via `blockchainService.submitSignedTransaction(...)`:
+From an MEV exposure standpoint, the key point is that ordering and inclusion are not purely technical; they are economic. The stronger the fee selection is tied to a single instantaneous value, the more likely the system experiences fee outliers and uncertain landing time under changing network conditions.
 
-```ts
-const unsignedTransaction = await this.buildUnsignedTransaction(
-  sourceAccount.cryptoWalletAddress,
-  destinationAccount.cryptoWalletAddress,
-  BigInt(transferStep.fromAmount),
-  payment.fromCurrency || "USDC",
-);
+This is not “an attacker stealing funds,” but it is still a form of MEV exposure because the same actors and mechanisms that generate MEV (searchers bidding, builders selecting profitable bundles, validators preferring certain flows) shape inclusion outcomes. The impact shows up as:
 
-// Sign transaction with Turnkey using the provided stamp
-signedTransaction = await this.signTransactionWithTurnkey(
-  workspace.turnkeySubOrgId,
-  sourceAccount.cryptoWalletAddress,
-  unsignedTransaction,
-  signature,
-  payment.fromNetwork as NetworkKey,
-);
+* higher-than-necessary fees in some cases,
+* delayed confirmations in other cases.
 
-// Submit signed transaction to blockchain
-const txHash = await this.blockchainService.submitSignedTransaction(
-  signedTransaction,
-  destinationAccount.cryptoWalletAddress,
-  BigInt(transferStep.fromAmount),
-  payment.fromCurrency || "USDC",
-  payment.fromNetwork as NetworkKey,
-);
-```
+### 3) Privacy exposure: payment flows are observable and linkable
 
-This means MEV analysis should be centered on:
+A public on-chain ERC-20 transfer reveals the sender, recipient, token contract, amount, and timing. That means payment flows can be monitored and correlated. This matters more for payment systems than for casual transfers, because repeated payments from a custodial wallet can create a clear, linkable behavioral footprint.
 
-1. visibility and ordering/inclusion dynamics (mempool / builder behavior),
-2. fee bidding strategy (risk of overpaying or being delayed),
-3. nonce and retry/replace patterns (risk of unintended replacement chains),
-   and not on classic DEX sandwich attacks (because there is no price impact mechanism here).
+Nothing in the shown code suggests an attempt to hide transaction details at broadcast time (for example, private submission pathways). Therefore, assuming standard broadcast behavior behind `submitSignedTransaction`, this flow is exposed to mempool and on-chain observers.
 
-## MEV exposure: what is low risk vs what is realistic
+This privacy exposure is a legitimate MEV-related concern because visibility is a prerequisite for many MEV behaviors: if a transaction is visible before inclusion, third parties can react to it. In this specific payment design, the reaction is unlikely to be “profit via sandwich,” but visibility still enables surveillance and targeted inclusion preferences.
 
-### 1) Value extraction via sandwich/arbitrage is low for this flow
+### 4) Nonce handling can create operational MEV-like failure modes
 
-The canonical MEV patterns that extract value from users (sandwiching, backrunning swaps, oracle manipulation around execution) generally require a transaction to move a market price or create an arbitrageable state transition. In this code path, the transaction is a simple ERC-20 transfer. A third party cannot “sandwich” a transfer in a way that changes the sender’s execution price, because there is no price function being executed.
-
-As a result, the risk of direct value extraction from the transaction’s semantics is low.
-
-That said, “low” does not mean “zero.” There are still indirect ways MEV ecosystem behavior can impose costs:
-
-* paying more than necessary to get included,
-* being delayed or not included promptly under certain network conditions,
-* revealing payment flows that can be used for surveillance or targeted behavior.
-
-These are not sandwich/arbitrage MEV, but they still fall under “MEV exposure” in practice because they arise from the same ordering/inclusion marketplace.
-
-### 2) Exposure to inclusion delay and fee outliers is realistically present
-
-The transaction fee strategy uses:
-
-```ts
-publicClient.getGasPrice()
-```
-
-and constructs a legacy `gasPrice` transaction rather than using explicit EIP-1559 style fee caps (`maxFeePerGas` and `maxPriorityFeePerGas`). On chains like Polygon, fee conditions can change quickly. A single-point gas price quote can be:
-
-* too high (leading to systematic overpayment),
-* too low (leading to long pending times),
-* volatile across time-of-day (creating measurable outliers).
-
-From an MEV perspective, this is exposure to the inclusion marketplace: if the bid is not aligned with current builder/validator preferences, inclusion becomes uncertain. Practically, the system will either pay more than needed to avoid delay (cost leakage) or suffer longer landing times (latency exposure). Your team’s dashboard tasks around “how long does it take our transactions to land” and “outliers + comparison to blockchain avgs” fit directly here.
-
-### 3) Mempool visibility (privacy) is a meaningful exposure for payments
-
-Even when the transfer itself is not exploitable via arbitrage, a public broadcast reveals:
-
-* sender address (custodial wallet),
-* receiver address,
-* token contract,
-* amount,
-* timing patterns.
-
-This is important because payments are often more sensitive than trading. If a single custodial wallet is used for many customers, on-chain observers can correlate flows across customers. The code currently uses stablecoin transfer contracts and customer-specific destinations, which makes transactions easy to classify as “payment transfers” from a known service wallet.
-
-Nothing in the shown code suggests private submission or bundle-only delivery; it is built as a standard signed transaction broadcast via an RPC. Under that assumption, privacy exposure is real and ongoing.
-
-### 4) Nonce handling can amplify fee/latency problems
-
-Nonce is fetched here:
+The nonce is fetched as:
 
 ```ts
 publicClient.getTransactionCount({ address: checksummedAddress })
 ```
 
-Depending on the client defaults, `getTransactionCount` may use `latest` rather than `pending`. If there are pending transactions from the same custodial wallet, using a `latest` nonce can cause collisions or unintended replacement patterns. The immediate code snippet does not show any explicit retry/replace logic, but in real systems, “stuck tx” handling often exists elsewhere (workers, queue retries, etc.). If replacement happens, the system can enter fee escalation loops, which is another common source of fee outliers.
+If the wallet can have multiple pending transactions, and if the nonce is not derived with pending awareness, it becomes easier to create operational patterns that resemble MEV competition: transactions replacing each other, fee escalation, and inconsistent inclusion. The code shown does not include explicit replacement logic, but nonce selection is foundational; if this is wrong, the system tends to compensate later by retrying and increasing fees.
 
-This is less about adversarial MEV and more about operational exposure to the same mempool auction dynamics. It still belongs in an MEV exposure report because it affects how the transaction competes for inclusion.
+This is relevant to MEV exposure because it increases the probability that the service “pays the auction” inefficiently or suffers unpredictable inclusion behavior.
 
-## Why QuickNode/RPC utilities matter to MEV exposure (as implied by the task list)
+## Conclusions
 
-Your weekly task list asks: “What exactly is happening when we estimate gas currently” and “Does QuickNode have any utilities we are or can leverage?”
+Based on the code provided:
 
-From the code, gas estimation consists of:
+1. The on-chain payment execution is a single ERC-20 `transfer(to, amount)` for USDC/USDT. This makes classic trading MEV (sandwiching/arbitrage around swaps) low likelihood for this path.
 
-* RPC gas price quote (`getGasPrice`)
-* RPC execution simulation (`estimateGas`)
-* a fixed 10% buffer
+2. The realistic MEV exposure is primarily about inclusion and ordering outcomes: fee outliers and confirmation latency variance driven by mempool competition and the fee selection approach.
 
-This is simple and workable, but it does not explicitly incorporate:
+3. There is meaningful privacy exposure because payment transfers are inherently observable and may be linkable across customers when using a shared custodial wallet.
 
-* fee history distribution,
-* percentile-based fee selection,
-* predictive landing-time targeting,
-* tracking mempool conditions.
+4. Nonce handling is a secondary but important contributor: if concurrency exists, nonce strategy can amplify cost/latency variance and create replacement patterns that increase exposure to the inclusion auction.
 
-RPC providers (including QuickNode) commonly expose standard Ethereum JSON-RPC methods such as `eth_feeHistory` (for fee distributions) and may offer enhanced endpoints/analytics depending on plan. Even without proprietary endpoints, a more robust fee strategy can be built from standard primitives. In other words, “utilities” matter because the current strategy is single-sample and therefore more exposed to outliers.
+## Notes on evidence and limits
 
-## Practical conclusions (based on the current implementation)
+This report is strictly grounded in the behavior visible in `executePayment()` and `buildUnsignedTransaction()`. The final broadcast behavior depends on how `blockchainService.submitSignedTransaction(...)` is implemented (for example, whether it uses standard public RPC submission). The conclusions above assume standard public broadcast semantics, which is consistent with the overall design shown.
 
-1. The dominant MEV risk is not “value extraction from swaps,” because the code does not swap or trade. The on-chain action is a stablecoin transfer.
-2. The realistic MEV exposure is operational:
+---
 
-   * fee outliers from a simplistic gas price strategy,
-   * delayed inclusion under congestion,
-   * privacy exposure of payment flows.
-3. Nonce handling details (pending vs latest) and any external retry behavior will strongly influence fee and latency variance, even if no adversary is “attacking.”
+## 中文：你需要粘贴哪些内容到 md 里？
 
-## Recommendations that follow directly from the code
+把上面从 `# MEV Exposure Report (Payment Service)` 开始到最后的全部内容（包括代码块）**原样复制**，粘贴进一个新文件，比如 `mev_exposure_report.md`，保存即可。
 
-These suggestions are intentionally scoped to what the code is doing today.
+如果你愿意再进一步“坐实”最后一段的假设，你把 `blockchainService.submitSignedTransaction` 的实现贴出来，我可以把 “public broadcast 假设” 改成“代码证明的事实”，让报告更扎实。
 
-### 1) Improve fee selection to reduce outliers and landing-time variance
-
-The current approach:
-
-```ts
-publicClient.getGasPrice()
-```
-
-is a single value that may not match current inclusion conditions. A more stable approach is to select fees based on recent blocks (fee history) and choose a percentile appropriate for the target landing time. This reduces both overpaying and stuck transactions. Even if the chain uses legacy behavior, smoothing and bounding gas price selection helps.
-
-### 2) Ensure nonce is derived with pending awareness
-
-If multiple payments can be executed concurrently from the same custodial wallet, use pending nonce semantics to avoid collisions and unintended replacement. This reduces operational exposure where transactions fight each other for inclusion and create fee escalation patterns.
-
-### 3) Consider privacy-aware submission paths for sensitive payments (optional, based on product requirements)
-
-If customer privacy and transaction observability are important, evaluate whether certain payments should be submitted through a private path rather than public broadcast. This is not required to prevent sandwich attacks (since transfers are low-risk), but it can reduce surveillance and targeted behavior. Whether this is worth it depends on business requirements, compliance constraints, and cost.
-
-### 4) Log and measure the variables that explain MEV-like behavior
-
-Even a simple report benefits from concrete metrics. The code already persists timestamps (`submittedAt`, `confirmedAt`) and fee fields (`networkFeeAmount` in `stepsTable`). Ensure the system consistently records:
-
-* broadcast time,
-* confirmation time,
-* effective paid fee (from receipt),
-* any replacement attempts (if they exist),
-  so that outliers can be explained rather than treated as noise.
-
-## Closing note
-
-Given the current code path, the MEV story is straightforward: the on-chain payment is a stablecoin transfer, which is structurally resistant to classic trading MEV, but it is still exposed to the inclusion auction and public visibility of mempool/chain. Most improvements therefore come from better fee/nonce engineering and, if desired, privacy-aware broadcast strategies rather than swap-protection mechanisms.
