@@ -140,8 +140,5 @@ Based on the code provided:
 
 4. Nonce handling is a secondary but important contributor: if concurrency exists, nonce strategy can amplify cost/latency variance and create replacement patterns that increase exposure to the inclusion auction.
 
-## Notes on evidence and limits
-
-This report is strictly grounded in the behavior visible in `executePayment()` and `buildUnsignedTransaction()`. The final broadcast behavior depends on how `blockchainService.submitSignedTransaction(...)` is implemented (for example, whether it uses standard public RPC submission). The conclusions above assume standard public broadcast semantics, which is consistent with the overall design shown.
 
 
